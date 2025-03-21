@@ -214,3 +214,13 @@ After all services are running, you can access:
 - 💬 [Discord Community](https://discord.gg/X8fU4Q2x)
 
 ⭐ Star this repository to stay updated on new releases!
+
+---
+
+## 📄 License
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+Vexa is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
+
+The Vexa name and logo are trademarks of Vexa.ai Inc. See [TRADEMARK.md](TRADEMARK.md) for more information.
