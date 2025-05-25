@@ -1,0 +1,198 @@
+version: '3.8'
+
+# Placeholder for Artifact Registry - REPLACE with your actual AR path
+# e.g., us-central1-docker.pkg.dev/YOUR_PROJECT_ID/YOUR_AR_REPO_NAME
+x-default-image-prefix: &default_image_prefix "europe-west1-docker.pkg.dev/your-gcp-project-id/vexa-images" 
+
+# Placeholder for external network name if Traefik needs to connect to a GCP LB's network
+# x-traefik-external-network: &traefik_external_network "gcp-lb-net" 
+
+services:
+  api-gateway:
+    image: ${IMAGE_PREFIX:-*default_image_prefix}/vexa-api-gateway:latest
+    environment:
+      - ADMIN_API_URL=http://admin-api:8001
+      - BOT_MANAGER_URL=http://bot-manager:8080
+      - TRANSCRIPTION_COLLECTOR_URL=http://transcription-collector:8000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      - admin-api
+      - bot-manager
+      - transcription-collector
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.api-gateway.rule=Host(`${TRAEFIK_HOST:-api.vexa.local}`)" # Use env var for host
+        - "traefik.http.routers.api-gateway.entrypoints=web"
+        - "traefik.http.services.api-gateway.loadbalancer.server.port=8000" # Internal port of api-gateway
+
+  admin-api:
+    image: ${IMAGE_PREFIX:-*default_image_prefix}/vexa-admin-api:latest
+    environment:
+      - REDIS_URL=redis://${REDIS_HOST}:${REDIS_PORT:-6379}/0
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-vexa}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme} # Use Swarm Secrets for this!
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-default-token}
+    depends_on:
+      # Dependencies on external Redis/Postgres are conceptual; Swarm won't wait. App needs retry logic.
+      - redis # Keep for service discovery if running Redis in Swarm, remove if fully external
+      - postgres # Keep for service discovery if running Postgres in Swarm, remove if fully external
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 1
+
+  bot-manager:
+    image: ${IMAGE_PREFIX:-*default_image_prefix}/vexa-bot-manager:latest
+    environment:
+      - REDIS_URL=redis://${REDIS_HOST}:${REDIS_PORT:-6379}/0
+      - BOT_IMAGE_NAME=${IMAGE_PREFIX:-*default_image_prefix}/vexa-bot:dev
+      - DOCKER_NETWORK=vexa_stack_vexa_default # Will be prefixed by stack name
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-vexa}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme} # Use Swarm Secrets for this!
+      - DOCKER_HOST=unix://var/run/docker.sock
+      - DEVICE_TYPE=cpu # Explicitly CPU
+      - WHISPER_LIVE_CPU_URL=ws://whisperlive-cpu:9092
+      # WHISPER_LIVE_GPU_URL is not needed for CPU-only, or set to dummy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - redis # Conceptual
+      - postgres # Conceptual
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # CPU version of WhisperLive - models should be baked into the image
+  whisperlive-cpu:
+    image: ${IMAGE_PREFIX:-*default_image_prefix}/vexa-whisperlive-cpu:latest
+    environment:
+      - REDIS_STREAM_URL=redis://${REDIS_HOST}:${REDIS_PORT:-6379}/0/transcription_segments # Check this key if used
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - LANGUAGE_DETECTION_SEGMENTS=${LANGUAGE_DETECTION_SEGMENTS:-10}
+      - VAD_FILTER_THRESHOLD=${VAD_FILTER_THRESHOLD:-0.5}
+      - DEVICE_TYPE=cpu # Explicitly CPU
+      # Model path should be internal to the image now
+    command: # Assuming run_server.py uses env vars or fixed paths for the baked-in tiny model
+      - "python3"
+      - "/app/run_server.py"
+      - "--port"
+      - "9092"
+      - "--backend"
+      - "faster_whisper"
+      # - "-fw" # This might not be needed if run_server.py defaults to the baked-in model path
+      # - "/app/models/faster-whisper-tiny" # Example path if model is copied to /app/models in Dockerfile
+    networks:
+      - vexa_default
+      - whispernet
+    deploy:
+      replicas: 1 # Adjust as needed for CPU load
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9093/health"] # Assuming health check port is 9093
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  traefik:
+    image: traefik:v2.10 # Or your preferred version
+    ports:
+      - "${TRAEFIK_WEB_PORT:-80}:80"
+      - "${TRAEFIK_DASHBOARD_PORT:-8080}:8080" # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    configs:
+      - source: traefik_config # Swarm Config
+        target: /etc/traefik/traefik.toml
+    command:
+      - "--api.insecure=true" # For dashboard; secure this in production
+      - "--providers.docker=true"
+      - "--providers.docker.swarmMode=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=${LOG_LEVEL:-INFO}"
+      # Add persistent volume for ACME certs if using Let's Encrypt in production
+      # - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    networks:
+      - vexa_default
+      # Add external network if interfacing with GCP LB directly
+      # - *traefik_external_network 
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager # Good to run on manager for API access & stable IP if needed
+
+  transcription-collector:
+    image: ${IMAGE_PREFIX:-*default_image_prefix}/vexa-transcription-collector:latest
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-vexa}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-changeme} # Use Swarm Secrets for this!
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # ... other env vars for collector
+    depends_on:
+      - redis # Conceptual
+      - postgres # Conceptual
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 1
+
+  # Externalized services - these are for environment variable setup, not actual deployment
+  # Swarm does not manage external services. Application needs to connect to them.
+  redis: # This is a conceptual service, actual Redis is external (Memorystore)
+    image: redis:7.0-alpine # Image not strictly needed if only for env vars / service discovery name
+    # No deploy section, no ports, no volumes
+    # Its presence can help with service name resolution if other services use `redis` as hostname
+    # But for external services, direct IP/host in env var is more explicit
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 0 # Do not deploy if fully external
+
+  postgres: # This is a conceptual service, actual Postgres is external (Cloud SQL)
+    image: postgres:15-alpine # Image not strictly needed
+    # No deploy section, no ports, no volumes
+    networks:
+      - vexa_default
+    deploy:
+      replicas: 0 # Do not deploy if fully external
+
+networks:
+  vexa_default:
+    driver: overlay
+    attachable: true
+  whispernet: # Still useful if whisperlive-cpu needs to be on a separate data plane for some reason
+    driver: overlay
+
+configs:
+  traefik_config:
+    external: true
+
+# Secrets (recommended for DB_PASSWORD etc.)
+# secrets:
+#   postgres_password:
+#     external: true # Assumes 'postgres_password' is created via 'docker secret create'
+#   redis_password:
+#     external: true 

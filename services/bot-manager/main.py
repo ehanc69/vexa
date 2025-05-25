@@ -16,7 +16,7 @@ import json
 # from app.tasks.monitoring import celery_app # Not used here
 
 from config import BOT_IMAGE_NAME, REDIS_URL
-from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start, get_running_bots_status
+from docker_utils import start_bot_container, stop_bot_container, _record_session_start, get_running_bots_status
 from shared_models.database import init_db, get_db, async_session_local
 from shared_models.models import User, Meeting, MeetingSession # <--- ADD MeetingSession import
 from shared_models.schemas import MeetingCreate, MeetingResponse, Platform, BotStatusResponse # Import new schemas and Platform
@@ -65,10 +65,10 @@ async def startup_event():
     logger.info("Starting up Bot Manager...")
     # await init_db() # Removed - Admin API should handle this
     # await init_redis() # Removed redis init if not used elsewhere
-    try:
-        get_socket_session()
-    except Exception as e:
-        logger.error(f"Failed to initialize Docker client on startup: {e}", exc_info=True)
+    # try:
+    #     get_socket_session() # Removed, Docker client is initialized on demand by docker_utils.get_docker_client()
+    # except Exception as e:
+    #     logger.error(f"Failed to initialize Docker client on startup: {e}", exc_info=True)
 
     # --- ADD Redis Client Initialization ---
     try:
@@ -99,8 +99,10 @@ async def shutdown_event():
             logger.error(f"Error closing Redis connection: {e}", exc_info=True)
     # ---------------------------------
 
-    close_docker_client()
-    logger.info("Docker Client closed.")
+    # close_docker_client() # Removed, no explicit client closing needed for SDK client like this
+    # logger.info("Docker Client closed.") # Removed
+
+    logger.info("Bot Manager shutdown complete.") # Added a final shutdown message
 
 # --- ADDED: Delayed Stop Task ---
 async def _delayed_container_stop(container_id: str, delay_seconds: int = 30):

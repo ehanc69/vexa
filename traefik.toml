@@ -1,21 +1,22 @@
+# traefik.toml
+# Minimal configuration for Traefik with Docker Swarm
+# More advanced configurations (entrypoints, SSL, etc.) can be added here.
+
+[log]
+  level = "INFO" # Or DEBUG for more verbosity
+
 [api]
-  insecure = true
+  insecure = true # Enables the Traefik dashboard on :8080. Secure this in production.
   dashboard = true
 
 [entryPoints]
   [entryPoints.web]
     address = ":80"
 
-[providers]
   [providers.docker]
-    exposedByDefault = false
-    network = "vexa_default"
-    watch = true
-
-[log]
-  level = "DEBUG"
-
-[accessLog]
+  swarmMode = true
+  exposedByDefault = false # Explicitly expose services via labels in docker-compose
+  network = "vexa_stack_vexa_default" # The network Traefik will look for services on (stack_networkname)
 
 # Optional: Enable the ping middleware for health checks
 [ping]

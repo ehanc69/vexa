@@ -1,10 +1,6 @@
-name: vexa
-
 services:
   api-gateway:
-    build:
-      context: .
-      dockerfile: services/api-gateway/Dockerfile
+    image: localhost:5000/vexa-api-gateway:latest # ADJUST REGISTRY AND IMAGE NAME AS NEEDED
     ports:
       - "${API_GATEWAY_HOST_PORT:-8056}:8000"
     environment:
@@ -14,20 +10,19 @@ services:
       - LOG_LEVEL=DEBUG
     init: true
     depends_on:
-      admin-api:
-        condition: service_started
-      bot-manager:
-        condition: service_started
-      transcription-collector:
-        condition: service_started
+      - admin-api
+      - bot-manager
+      - transcription-collector
     networks:
       - vexa_default
-    restart: unless-stopped
+    deploy:
+      replicas: 1
 
   admin-api:
-    build:
-      context: .
-      dockerfile: services/admin-api/Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: services/admin-api/Dockerfile
+    image: localhost:5000/vexa-admin-api:latest # ADDED IMAGE LINE
     ports:
       - "${ADMIN_API_HOST_PORT:-8057}:8001"
     env_file:
@@ -42,22 +37,22 @@ services:
       - LOG_LEVEL=DEBUG
     init: true
     depends_on:
-      redis:
-        condition: service_started
-      postgres:
-        condition: service_healthy
+      - redis
+      - postgres
     networks:
       - vexa_default
-    restart: unless-stopped
+    deploy:
+      replicas: 1
 
   bot-manager:
-    build:
-      context: .
-      dockerfile: services/bot-manager/Dockerfile
+    image: localhost:5000/vexa-bot-manager:latest # ADJUST REGISTRY AND IMAGE NAME AS NEEDED
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - BOT_IMAGE_NAME=${BOT_IMAGE_NAME:-vexa-bot:dev}
-      - DOCKER_NETWORK=${COMPOSE_PROJECT_NAME:-vexa}_vexa_default
+      - BOT_IMAGE_NAME=localhost:5000/vexa-bot:dev # IMPORTANT: vexa-bot image from your registry
+      # This will be the overlay network name created by Swarm.
+      # If stack name is 'vexa_stack' and network in YAML is 'vexa_default',
+      # the actual network name will be 'vexa_stack_vexa_default'.
+      - DOCKER_NETWORK=vexa_stack_vexa_default 
       - LOG_LEVEL=DEBUG
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -72,19 +67,19 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     init: true
     depends_on:
-      redis:
-        condition: service_started
-      postgres:
-        condition: service_healthy
+      - redis
+      - postgres
     networks:
       - vexa_default
-    restart: unless-stopped
+    deploy:
+      replicas: 1
 
   whisperlive:
-    profiles: ["gpu"]
-    build:
-      context: .
-      dockerfile: services/WhisperLive/Dockerfile.project
+    # profiles: ["gpu"] # Manage this by deploying/not deploying the service or separate stack files
+    # build:
+    #   context: .
+    #   dockerfile: services/WhisperLive/Dockerfile.project
+    image: localhost:5000/vexa-whisperlive-gpu:latest # ADDED IMAGE LINE (ensure this is your GPU variant)
     volumes:
       - ./hub:/root/.cache/huggingface/hub
       - ./services/WhisperLive/models:/app/models
@@ -115,13 +110,22 @@ services:
       - "9090" #use for transcription web socket
       - "9091" #use for health check
     deploy:
-      replicas: 1 # Sets to 1 to avoid GPU contention
+      replicas: 1 # Keep 1 for GPU typically
+      # placement:
+      #   constraints:
+      #     - node.labels.gpu == true # Example: Label your GPU node(s) `docker node update --label-add gpu=true <node-name>`
       resources:
         reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["3"] # Ensure this is configurable or correct for your setup
-              capabilities: [gpu]
+          # devices:  # This syntax is problematic for docker stack deploy
+          #   - driver: nvidia
+          #     capabilities: [gpu]
+          generic_resources:
+            - discrete_resource_spec:
+                kind: "NVIDIA-GPU" # This kind depends on how GPUs are exposed to Swarm. Common for nvidia-docker2.
+                value: 1 # Number of GPUs to reserve
+      update_config:
+        parallelism: 1
+        delay: 30s # Allow more time for model loading
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/health"]
       interval: 10s
@@ -130,8 +134,7 @@ services:
       start_period: 30s # Give time for model loading
     init: true
     depends_on:
-      transcription-collector:
-        condition: service_started
+      - transcription-collector
     networks:
       - vexa_default
       - whispernet
@@ -154,10 +157,11 @@ services:
 
   # CPU version of WhisperLive for users without GPU
   whisperlive-cpu:
-    profiles: ["cpu"]
-    build:
-      context: .
-      dockerfile: services/WhisperLive/Dockerfile.cpu
+    # profiles: ["cpu"] # Manage via separate stack files or service deployment choices
+    # build:
+    #   context: .
+    #   dockerfile: services/WhisperLive/Dockerfile.cpu
+    image: localhost:5000/vexa-whisperlive-cpu:latest # ADDED IMAGE LINE (ensure this is your CPU variant)
     volumes:
       - ./hub:/root/.cache/huggingface/hub
       - ./services/WhisperLive/models:/app/models
@@ -193,8 +197,7 @@ services:
       start_period: 60s # Longer start period for CPU model loading
     init: true
     depends_on:
-      transcription-collector:
-        condition: service_started
+      - transcription-collector
     networks:
       - vexa_default
       - whispernet
@@ -241,9 +244,10 @@ services:
     restart: unless-stopped
 
   transcription-collector:
-    build:
-      context: .
-      dockerfile: services/transcription-collector/Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: services/transcription-collector/Dockerfile
+    image: localhost:5000/vexa-transcription-collector:latest # ADDED IMAGE LINE
     ports:
       - "${TRANSCRIPTION_COLLECTOR_HOST_PORT:-8123}:8000"
     environment:
@@ -265,10 +269,8 @@ services:
       - LOG_LEVEL=DEBUG
     init: true
     depends_on:
-      redis:
-        condition: service_started
-      postgres:
-        condition: service_healthy
+      - redis
+      - postgres
     networks:
       - vexa_default
     restart: unless-stopped
@@ -308,6 +310,7 @@ volumes:
 
 networks:
   vexa_default:
-    driver: bridge
+    driver: overlay
+    attachable: true
   whispernet:
-    driver: bridge
+    driver: overlay

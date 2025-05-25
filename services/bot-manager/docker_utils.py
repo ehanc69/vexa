@@ -1,133 +1,130 @@
-import requests_unixsocket
-import requests  # Make sure standard requests is imported
+import docker # Official Docker SDK
+from docker.types import ServiceMode, TaskTemplate, ContainerSpec, RestartPolicy, Mount # Common Swarm types
+# from docker.types.networks import NetworkAttachment # Direct import for NetworkAttachment - REMOVED
+from docker.errors import APIError, NotFound as DockerNotFound # Docker SDK errors
 import logging
 import json
 import uuid
 import os
-import time
+import time # Keep for now, might be used in retry logic if any
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 import asyncio
 
-# Explicitly import the exceptions from requests
-from requests.exceptions import RequestException, ConnectionError, HTTPError
+# Remove old socket/requests related imports
+# import requests_unixsocket
+# import requests
+# from requests.exceptions import RequestException, ConnectionError, HTTPError
 
 # Import the Platform class from shared models
-from shared_models.schemas import Platform
+from shared_models.schemas import Platform # Keep
 
-# ---> ADD Missing imports for _record_session_start
+# ---> ADD Missing imports for _record_session_start (Keep if still relevant, or remove if logic changes)
 from shared_models.database import async_session_local
 from shared_models.models import MeetingSession, Meeting
 # <--- END ADD
 
-# ---> ADD Missing imports for check logic & session start
+# ---> ADD Missing imports for check logic & session start (Keep if still relevant)
 from fastapi import HTTPException # For raising limit error
 from app.database.service import TranscriptionService # To get user limit
 from sqlalchemy.future import select
-from shared_models.models import User, MeetingSession
+from shared_models.models import User # MeetingSession already imported
 # <--- END ADD
 
 # Assuming these are still needed from config or env
-DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix://var/run/docker.sock")
-DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "vexa_default")
-BOT_IMAGE_NAME = os.environ.get("BOT_IMAGE_NAME", "vexa-bot:dev")
+# DOCKER_HOST is no longer directly used by docker.from_env() if socket is default
+# DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix://var/run/docker.sock") # Not needed by docker.from_env() usually
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "vexa_vexa_default") # CRITICAL: This must be the Swarm overlay network name
+BOT_IMAGE_NAME = os.environ.get("BOT_IMAGE_NAME", "vexa-bot:dev") # This will be the image for the vexa-bot service
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 DEVICE_TYPE = os.environ.get("DEVICE_TYPE", "cuda").lower()
 
 logger = logging.getLogger("bot_manager.docker_utils")
 
-# Global session for requests_unixsocket
-_socket_session = None
+# Global Docker client
+_docker_client = None
 
-# Define a local exception
-class DockerConnectionError(Exception):
-    pass
+# Define a local exception (can be removed if Docker SDK exceptions are sufficient)
+# class DockerConnectionError(Exception):
+#     pass
 
-def get_socket_session(max_retries=3, delay=2):
-    """Initializes and returns a requests_unixsocket session with retries."""
-    global _socket_session
-    if _socket_session is None:
-        logger.info(f"Attempting to initialize requests_unixsocket session for {DOCKER_HOST}...")
+def get_docker_client(max_retries=3, delay=2):
+    """Initializes and returns a Docker SDK client with retries if needed."""
+    global _docker_client
+    if _docker_client is None:
+        logger.info("Attempting to initialize Docker SDK client...")
         retries = 0
-        # Extract socket path correctly AND ensure it's absolute
-        socket_path_relative = DOCKER_HOST.split('//', 1)[1]
-        socket_path_abs = f"/{socket_path_relative}" # Prepend slash for absolute path
-
-        # URL encode path separately using the absolute path
-        # The http+unix scheme requires the encoded absolute path
-        socket_path_encoded = socket_path_abs.replace("/", "%2F")
-        socket_url = f'http+unix://{socket_path_encoded}'
-
         while retries < max_retries:
             try:
-                # Check socket file exists before attempting connection using the absolute path
-                logger.debug(f"Checking for socket file at absolute path: {socket_path_abs}") # Added debug log
-                if not os.path.exists(socket_path_abs):
-                     # Ensure the error message shows the absolute path being checked
-                     raise FileNotFoundError(f"Docker socket file not found at: {socket_path_abs}")
-
-                logger.debug(f"Attempt {retries+1}/{max_retries}: Creating session.")
-                temp_session = requests_unixsocket.Session()
-
-                # Test connection by getting Docker version via the correctly formed URL
-                logger.debug(f"Attempt {retries+1}/{max_retries}: Getting Docker version via {socket_url}/version")
-                response = temp_session.get(f'{socket_url}/version')
-                response.raise_for_status() # Raise HTTPError for bad responses
-                version_data = response.json()
+                temp_client = docker.from_env()
+                # Test connection by getting Docker version
+                version_data = temp_client.version()
                 api_version = version_data.get('ApiVersion')
-                logger.info(f"requests_unixsocket session initialized. Docker API version: {api_version}")
-                _socket_session = temp_session # Assign only on success
-                return _socket_session
-
-            except FileNotFoundError as e:
-                 # Log the actual exception message which now includes the absolute path
-                 logger.warning(f"Attempt {retries+1}/{max_retries}: {e}. Retrying in {delay}s...")
-            except ConnectionError as e:
-                 logger.warning(f"Attempt {retries+1}/{max_retries}: Socket connection error ({e}). Is Docker running? Retrying in {delay}s...")
-            except HTTPError as e:
-                logger.error(f"Attempt {retries+1}/{max_retries}: HTTP error communicating with Docker socket: {e}", exc_info=True)
-                 # Don't retry on HTTP errors like 4xx/5xx immediately, might be persistent issue
-                break
-            except Exception as e:
-                logger.error(f"Attempt {retries+1}/{max_retries}: Failed to initialize requests_unixsocket session: {e}", exc_info=True)
+                logger.info(f"Docker SDK client initialized. Docker API version: {api_version}")
+                _docker_client = temp_client # Assign only on success
+                return _docker_client
+            except APIError as e: # Catch Docker SDK specific API errors
+                logger.warning(f"Attempt {retries+1}/{max_retries}: Docker API error during client initialization: {e}. Retrying in {delay}s...")
+            except Exception as e: # Catch other potential errors (e.g., if Docker daemon is not running)
+                logger.error(f"Attempt {retries+1}/{max_retries}: Failed to initialize Docker SDK client: {e}", exc_info=True)
 
             retries += 1
             if retries < max_retries:
                 time.sleep(delay)
             else:
-                logger.error(f"Failed to connect to Docker socket at {DOCKER_HOST} after {max_retries} attempts.")
-                _socket_session = None
-                raise DockerConnectionError(f"Could not connect to Docker socket after {max_retries} attempts.")
+                logger.error(f"Failed to connect to Docker via SDK after {max_retries} attempts.")
+                _docker_client = None # Ensure it's None on failure
+                raise DockerNotFound(f"Could not connect to Docker via SDK after {max_retries} attempts.") # Raise DockerNotFound or a custom error
 
-    return _socket_session
+    return _docker_client
 
-def close_docker_client(): # Keep name for compatibility in main.py
-    """Closes the requests_unixsocket session."""
-    global _socket_session
-    if _socket_session:
-        logger.info("Closing requests_unixsocket session.")
-        try:
-            _socket_session.close()
-        except Exception as e:
-            logger.warning(f"Error closing requests_unixsocket session: {e}")
-        _socket_session = None
+# The old close_docker_client is not strictly necessary for the SDK client
+# as it doesn't maintain an open session in the same way requests_unixsocket did.
+# However, if there are resources to be cleaned up by the client, its close method can be called.
+# For now, we'll remove it. If explicit cleanup is needed, a new function can be added.
+
+# def close_docker_client():
+#     global _docker_client
+#     if _docker_client:
+#         logger.info("Closing Docker SDK client (if applicable).")
+#         try:
+#             # The standard Docker client from from_env() doesn't have an explicit close() method
+#             # that releases resources like a requests.Session.
+#             # If using a custom APIClient, it might have client.close().
+#             pass
+#         except Exception as e:
+#             logger.warning(f"Error during Docker SDK client cleanup: {e}")
+#         _docker_client = None
 
 # Helper async function to record session start
-async def _record_session_start(meeting_id: int, session_uid: str):
-    try:
-        async with async_session_local() as db_session:
+async def _record_session_start(meeting_id: int, connection_id: str):
+    """Helper to record the session start in the database."""
+    # This function might need adjustment based on how connection_id maps to MeetingSession
+    # Assuming connection_id is unique and can identify the session.
+    async with async_session_local() as db:
+        try:
+            # Find the meeting
+            meeting_result = await db.execute(select(Meeting).filter(Meeting.id == meeting_id))
+            meeting = meeting_result.scalar_one_or_none()
+
+            if not meeting:
+                logger.error(f"Meeting with ID {meeting_id} not found for recording session start.")
+                return
+
+            # Create a new session entry
             new_session = MeetingSession(
                 meeting_id=meeting_id,
-                session_uid=session_uid, 
-                session_start_time=datetime.now(timezone.utc) # Record timestamp
+                connection_id=connection_id, # Assuming connection_id can be stored
+                status="active", # Or some initial status
+                # started_at will be set by default
             )
-            db_session.add(new_session)
-            await db_session.commit()
-            logger.info(f"Recorded start for session {session_uid} for meeting {meeting_id}")
-    except Exception as db_err:
-        logger.error(f"Failed to record session start for session {session_uid}, meeting {meeting_id}: {db_err}", exc_info=True)
-        # Log error but allow the main function to continue
+            db.add(new_session)
+            await db.commit()
+            logger.info(f"Recorded session start for meeting_id {meeting_id}, connection_id {connection_id}")
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Database error recording session start for meeting {meeting_id}: {e}", exc_info=True)
 
 # Make the function async
 async def start_bot_container(
@@ -140,10 +137,10 @@ async def start_bot_container(
     native_meeting_id: str,
     language: Optional[str],
     task: Optional[str]
-) -> Optional[tuple[str, str]]:
+) -> Optional[tuple[str, str]]: # Returns (service_id, connection_id)
     """
-    Starts a vexa-bot container via requests_unixsocket AFTER checking user limit.
-
+    Starts a vexa-bot Swarm service AFTER checking user limit.
+    Each bot runs as a separate Swarm service.
     Args:
         user_id: The ID of the user requesting the bot.
         meeting_id: Internal database ID of the meeting.
@@ -156,87 +153,72 @@ async def start_bot_container(
         task: Optional transcription task ('transcribe' or 'translate').
         
     Returns:
-        A tuple (container_id, connection_id) if successful, None otherwise.
+        A tuple (service_id, connection_id) if successful, None otherwise.
     """
+    client = None
+    try:
+        client = get_docker_client()
+    except DockerNotFound as e:
+        logger.error(f"Failed to get Docker client: {e}")
+        raise HTTPException(status_code=500, detail="Docker connection error.")
+    
+    if not client:
+         logger.error("Docker client not available after get_docker_client call.") # Should be caught by exception
+         raise HTTPException(status_code=500, detail="Docker client unavailable.")
+
     # === START: Bot Limit Check ===
     try:
-        # Fetch user details (including max_concurrent_bots)
         user = await TranscriptionService.get_or_create_user(user_id)
         if not user:
-             logger.error(f"User with ID {user_id} not found...")
+             logger.error(f"User with ID {user_id} not found for bot limit check.")
              raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
 
-        # Count currently running bots for this user using labels via Docker API Socket
-        session = get_socket_session() # Get the existing session
-        if not session:
-             logger.error("[Limit Check] Cannot count running bots, requests_unixsocket session not available.")
-             raise HTTPException(status_code=500, detail="Failed to connect to Docker to verify bot count.")
-             
-        try:
-            # Construct filters for Docker API
-            filters = json.dumps({
-                "label": [f"vexa.user_id={user_id}"],
-                "status": ["running"]
-            })
-            
-            # Make request to list containers endpoint
-            socket_path_relative = DOCKER_HOST.split('//', 1)[1]
-            socket_path_abs = f"/{socket_path_relative}"
-            socket_path_encoded = socket_path_abs.replace("/", "%2F")
-            socket_url_base = f'http+unix://{socket_path_encoded}'
-            list_url = f'{socket_url_base}/containers/json'
-            
-            logger.debug(f"[Limit Check] Querying {list_url} with filters: {filters}")
-            response = session.get(list_url, params={"filters": filters, "all": "false"})
-            response.raise_for_status() # Check for HTTP errors
-            
-            running_bots_info = response.json()
-            current_bot_count = len(running_bots_info)
-            logger.debug(f"[Limit Check] Found {current_bot_count} running bot containers for user {user_id} via socket API")
+        if not hasattr(user, 'max_concurrent_bots') or user.max_concurrent_bots is None:
+             logger.error(f"User {user_id} is missing the max_concurrent_bots attribute or it's not set.")
+             raise HTTPException(status_code=500, detail="User configuration error: Bot limit not set.")
+        
+        user_limit = user.max_concurrent_bots
 
-        except RequestException as sock_err:
-            logger.error(f"[Limit Check] Failed to count running bots via socket API for user {user_id}: {sock_err}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Failed to verify current bot count via Docker socket.")
-        except Exception as count_err: # Catch other potential errors like JSONDecodeError
-            logger.error(f"[Limit Check] Unexpected error counting running bots via socket API for user {user_id}: {count_err}", exc_info=True)
+        # Count currently running bot *services* for this user using labels
+        # Each bot is a service, so we count services.
+        service_label_filter = f"vexa.user_id={user_id}"
+        try:
+            running_bot_services = client.services.list(filters={"label": service_label_filter})
+            current_bot_count = len(running_bot_services)
+            logger.debug(f"[Limit Check] Found {current_bot_count} running bot services for user {user_id} with label '{service_label_filter}'. Limit: {user_limit}")
+        except APIError as api_err:
+            logger.error(f"[Limit Check] Docker API error counting services for user {user_id}: {api_err}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to verify current bot count due to Docker API error.")
+        except Exception as count_err:
+            logger.error(f"[Limit Check] Unexpected error counting services for user {user_id}: {count_err}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to process bot count verification.")
 
-        # Check against the user's limit (logic remains the same)
-        user_limit = user.max_concurrent_bots
-        logger.info(f"Checking bot limit for user {user_id}: Found {current_bot_count} running bots, limit is {user_limit}")
-
-        if not hasattr(user, 'max_concurrent_bots') or user_limit is None:
-             logger.error(f"User {user_id} is missing the max_concurrent_bots attribute...")
-             raise HTTPException(status_code=500, detail="User configuration error: Bot limit not set.")
-
         if current_bot_count >= user_limit:
-            logger.warning(f"User {user_id} reached bot limit ({user_limit})...")
+            logger.warning(f"User {user_id} reached bot limit ({current_bot_count}/{user_limit}). Cannot start new bot.")
             raise HTTPException(
                 status_code=403,
                 detail=f"User has reached the maximum concurrent bot limit ({user_limit})."
             )
-        logger.info(f"User {user_id} is under bot limit ({current_bot_count}/{user_limit}). Proceeding...")
+        logger.info(f"User {user_id} is under bot limit ({current_bot_count}/{user_limit}). Proceeding to start bot service...")
 
     except HTTPException as http_exc:
-         raise http_exc
+         raise http_exc # Re-raise known HTTP exceptions
     except Exception as e:
          logger.error(f"Error during bot limit check for user {user_id}: {e}", exc_info=True)
-         raise HTTPException(status_code=500, detail="Failed to verify bot limit.")
+         # Ensure a generic 500 is raised if not already an HTTPException
+         if not isinstance(e, HTTPException):
+             raise HTTPException(status_code=500, detail="Failed to verify bot limit due to an unexpected error.")
+         raise # Re-raise if it was already an HTTPException from deeper
     # === END: Bot Limit Check ===
 
-    # --- Original start_bot_container logic (using requests_unixsocket) --- 
-    session = get_socket_session()
-    if not session:
-        logger.error("Cannot start bot container, requests_unixsocket session not available.")
-        return None, None
+    connection_id = str(uuid.uuid4()) # This remains a good unique ID for the session/connection
+    service_name = f"vexa-bot-svc-{meeting_id}-{connection_id[:8]}" # Create a unique service name
 
-    container_name = f"vexa-bot-{meeting_id}-{uuid.uuid4().hex[:8]}"
-    if not bot_name:
-        bot_name = f"VexaBot-{uuid.uuid4().hex[:6]}"
-    connection_id = str(uuid.uuid4())
-    logger.info(f"Generated unique connectionId for bot session: {connection_id}")
+    if not bot_name: # Default bot name if not provided
+        bot_name = f"VexaBot-{connection_id[:6]}"
+    
+    logger.info(f"Preparing to start bot service '{service_name}' with connectionId: {connection_id}")
 
-    # Construct BOT_CONFIG JSON - Include new fields
     bot_config_data = {
         "meeting_id": meeting_id,
         "platform": platform,
@@ -244,240 +226,258 @@ async def start_bot_container(
         "botName": bot_name,
         "token": user_token,
         "nativeMeetingId": native_meeting_id,
-        "connectionId": connection_id,
+        "connectionId": connection_id, # Bot needs this to identify its session
         "language": language,
         "task": task,
         "redisUrl": REDIS_URL,
-        "automaticLeave": {
+        "automaticLeave": { # Example, ensure your bot uses this
             "waitingRoomTimeout": 300000,
             "noOneJoinedTimeout": 300000,
             "everyoneLeftTimeout": 300000
         }
     }
-    # Remove keys with None values before serializing
     cleaned_config_data = {k: v for k, v in bot_config_data.items() if v is not None}
     bot_config_json = json.dumps(cleaned_config_data)
 
-    logger.debug(f"Bot config: {bot_config_json}") # Log the full config
+    logger.debug(f"Bot service '{service_name}' config: {bot_config_json}")
 
-    # Determine WhisperLive URL based on DEVICE_TYPE
     device_type_env = DEVICE_TYPE
-    whisper_live_url = os.getenv('WHISPER_LIVE_CPU_URL', 'ws://whisperlive-cpu:9092') # Default to CPU URL
-
+    whisper_live_url = os.getenv('WHISPER_LIVE_CPU_URL', 'ws://whisperlive-cpu:9092') # Default to CPU
     if device_type_env == 'cuda':
         whisper_live_url = os.getenv('WHISPER_LIVE_GPU_URL', 'ws://whisperlive:9090')
-        logger.debug(f"DEVICE_TYPE is '{device_type_env}'. Using GPU WhisperLive URL: {whisper_live_url}")
-    else:
-        logger.debug(f"DEVICE_TYPE is '{device_type_env}'. Using CPU WhisperLive URL: {whisper_live_url}")
 
-    # These are the environment variables passed to the Node.js process  of the vexa-bot started by your entrypoint.sh.
-    environment = [
+    logger.debug(f"Service '{service_name}' using WhisperLive URL: {whisper_live_url} (derived from DEVICE_TYPE: {device_type_env})")
+
+    environment_vars = [
         f"BOT_CONFIG={bot_config_json}",
         f"WHISPER_LIVE_URL={whisper_live_url}",
         f"LOG_LEVEL={os.getenv('LOG_LEVEL', 'INFO').upper()}",
+        f"CONNECTION_ID={connection_id}", # Pass connection_id explicitly if bot needs it this way
     ]
 
-    # Ensure absolute path for URL encoding here as well
-    socket_path_relative = DOCKER_HOST.split('//', 1)[1]
-    socket_path_abs = f"/{socket_path_relative}"
-    socket_path_encoded = socket_path_abs.replace("/", "%2F")
-    socket_url_base = f'http+unix://{socket_path_encoded}'
-
-    # Docker API payload for creating a container
-    create_payload = {
-        "Image": BOT_IMAGE_NAME,
-        "Env": environment,
-        "Labels": {"vexa.user_id": str(user_id)}, # *** ADDED Label ***
-        "HostConfig": {
-            "NetworkMode": DOCKER_NETWORK,
-            "AutoRemove": True
-        },
+    service_labels = {
+        "vexa.user_id": str(user_id),
+        "vexa.meeting_id": str(meeting_id),
+        "vexa.connection_id": connection_id, # Useful for identifying the service later
+        "vexa.bot_service": "true"
     }
 
-    create_url = f'{socket_url_base}/containers/create?name={container_name}'
-    start_url_template = f'{socket_url_base}/containers/{{}}/start'
-
-    container_id = None # Initialize container_id
     try:
-        logger.info(f"Attempting to create bot container '{container_name}' ({BOT_IMAGE_NAME}) via socket ({socket_url_base})...")
-        response = session.post(create_url, json=create_payload)
-        response.raise_for_status()
-        container_info = response.json()
-        container_id = container_info.get('Id')
+        logger.info(f"Attempting to create bot service '{service_name}' (Image: {BOT_IMAGE_NAME}) on network '{DOCKER_NETWORK}'.")
 
-        if not container_id:
-            logger.error(f"Failed to create container: No ID in response: {container_info}")
-            return None, None
-
-        logger.info(f"Container {container_id} created. Starting...")
-
-        start_url = start_url_template.format(container_id)
-        response = session.post(start_url)
-
-        if response.status_code != 204:
-            logger.error(f"Failed to start container {container_id}. Status: {response.status_code}, Response: {response.text}")
-            # Consider removing the created container if start fails?
-            return None, None
-
-        logger.info(f"Successfully started container {container_id} for meeting: {meeting_id}")
+        # Define ContainerSpec for the task
+        container_spec = ContainerSpec(
+            image=BOT_IMAGE_NAME,
+            env=environment_vars,
+            labels=service_labels,
+            # Add mounts if vexa-bot needs any specific volumes (e.g. for logs, though usually stdout/stderr is preferred)
+            # mounts=[Mount(target="/path/in/container", source="named_volume_or_host_path", type="volume_or_bind")]
+        )
         
-        # *** REMOVED Session Recording Call - To be handled by caller ***
-        # try:
-        #     asyncio.run(_record_session_start(meeting_id, connection_id))
-        # except RuntimeError as e:
-        #     logger.error(f"Error running async session recording: {e}. Session start NOT recorded.")
+        # Define RestartPolicy for the task
+        restart_policy = RestartPolicy(
+            condition="on-failure", # or 'any', 'none'
+            delay=5,       # 5 seconds
+            max_attempts=3,
+            window=120      # 2 minutes
+        )
 
-        return container_id, connection_id # Return both values
+        # Define TaskTemplate
+        task_template = TaskTemplate(
+            container_spec=container_spec,
+            restart_policy=restart_policy
+            # Add resource constraints if needed for vexa-bot, e.g.
+            # resources={'Limits': {'MemoryBytes': 512 * 1024 * 1024}, 'Reservations': {'MemoryBytes': 128 * 1024 * 1024}}
+        )
 
-    except RequestException as e:
-        logger.error(f"HTTP error communicating with Docker socket: {e}", exc_info=True)
+        # Define Network Attachment manually as a dictionary due to broken SDK in image
+        # network_attachment = NetworkAttachment(
+        #      network=DOCKER_NETWORK, 
+        #      aliases=[service_name]
+        # )
+        network_attachment_dict = {
+            "Target": DOCKER_NETWORK,
+            "Aliases": [service_name]
+        }
+        
+        # Create the service
+        service = client.services.create(
+            name=service_name,
+            task_template=task_template,
+            mode=ServiceMode(mode='replicated', replicas=1), # Each bot is a single replica service
+            networks=[network_attachment_dict], # Use the manually created dict
+            labels=service_labels, # Labels on the service itself
+            endpoint_spec=None # Bots typically don't expose ports, they connect out
+        )
+
+        logger.info(f"Successfully created Swarm service '{service.name}' with ID: {service.id} for meeting: {meeting_id}, connection_id: {connection_id}")
+        
+        # Record session start in DB (ensure this function is robust)
+        try:
+            # Make sure this is awaited if it's an async function
+            await _record_session_start(meeting_id, connection_id) 
+        except Exception as db_err:
+            logger.error(f"Failed to record session start for service {service.id} / connection {connection_id}: {db_err}", exc_info=True)
+            # Decide if service creation should be rolled back if DB fails. For now, logging error.
+            # Could raise an exception here to indicate partial failure.
+
+        return service.id, connection_id
+
+    except APIError as e:
+        logger.error(f"Docker API error creating service '{service_name}': {e}", exc_info=True)
+        # Attempt to clean up if service object exists but ID was not returned or error occurred mid-creation
+        # This is complex as the service might or might not have been partially created.
+        # For now, relying on subsequent stop calls if something goes very wrong.
     except Exception as e:
-        logger.error(f"Unexpected error starting container via socket: {e}", exc_info=True)
+        logger.error(f"Unexpected error starting bot service '{service_name}': {e}", exc_info=True)
 
-    # Clean up created container if start failed or exception occurred before returning container_id
-    # This requires careful handling to avoid race conditions if another process is managing it.
-    # For now, relying on AutoRemove=True might be sufficient if start fails cleanly.
-    # If an exception happens between create and start success logging, container might linger.
+    return None, None # Explicitly return None, None on failure
 
-    return None, None # Return None for both if error occurs
-
-def stop_bot_container(container_id: str) -> bool:
-    """Stops a container using its ID via requests_unixsocket."""
-    session = get_socket_session()
-    if not session:
-        logger.error(f"Cannot stop container {container_id}, requests_unixsocket session not available.")
+def stop_bot_container(service_id_or_name: str) -> bool: # Parameter changed from container_id
+    """Stops and removes a vexa-bot Swarm service using its ID or name."""
+    client = None
+    try:
+        client = get_docker_client()
+    except DockerNotFound: # Or a broader exception if get_docker_client can raise others
+        logger.error(f"Cannot stop service {service_id_or_name}, Docker client not available.")
         return False
 
-    # Ensure absolute path for URL encoding here as well
-    socket_path_relative = DOCKER_HOST.split('//', 1)[1]
-    socket_path_abs = f"/{socket_path_relative}"
-    socket_path_encoded = socket_path_abs.replace("/", "%2F")
-    socket_url_base = f'http+unix://{socket_path_encoded}'
-    
-    stop_url = f'{socket_url_base}/containers/{container_id}/stop'
-    # Since AutoRemove=True, we don't need a separate remove call
+    if not client: # Should be caught by exception, but defensive check
+        logger.error(f"Cannot stop service {service_id_or_name}, Docker client is None after get_docker_client call.")
+        return False
 
     try:
-        logger.info(f"Attempting to stop container {container_id} via socket ({stop_url})...") # Log stop URL
-        # Send POST request to stop the container. Docker waits for it to stop.
-        # Timeout can be added via query param `t` (e.g., ?t=10 for 10 seconds)
-        response = session.post(f"{stop_url}?t=10") 
+        logger.info(f"Attempting to find and remove Swarm service '{service_id_or_name}'...")
+        service_to_remove = client.services.get(service_id_or_name)
         
-        # Check status code: 204 No Content (success), 304 Not Modified (already stopped), 404 Not Found
-        if response.status_code == 204:
-            logger.info(f"Successfully sent stop command to container {container_id}.")
-            return True
-        elif response.status_code == 304:
-            logger.warning(f"Container {container_id} was already stopped.")
-            return True
-        elif response.status_code == 404:
-            logger.warning(f"Container {container_id} not found, assuming already stopped/removed.")
-            return True 
-        else:
-            # Raise exception for other errors (like 500)
-            logger.error(f"Error stopping container {container_id}. Status: {response.status_code}, Body: {response.text}")
-            response.raise_for_status()
-            return False # Should not be reached if raise_for_status() works
+        # Get associated connection_id if needed for logging or other cleanup
+        connection_id = service_to_remove.attrs.get('Spec', {}).get('Labels', {}).get('vexa.connection_id', 'N/A')
+        meeting_id = service_to_remove.attrs.get('Spec', {}).get('Labels', {}).get('vexa.meeting_id', 'N/A')
 
-    except RequestException as e:
-        # Handle 404 specifically if raise_for_status() doesn't catch it as expected
-        if hasattr(e, 'response') and e.response is not None and e.response.status_code == 404:
-            logger.warning(f"Container {container_id} not found (exception check), assuming already stopped/removed.")
-            return True
-        logger.error(f"HTTP error stopping container {container_id}: {e}", exc_info=True)
+        service_to_remove.remove()
+        logger.info(f"Successfully removed Swarm service '{service_id_or_name}' (Meeting: {meeting_id}, Connection: {connection_id}).")
+        
+        # Add any additional cleanup related to this bot session if needed, e.g., DB update
+        # Example: await _record_session_stop(connection_id)
+        
+        return True # Corrected indentation
+        
+    except DockerNotFound:
+        logger.warning(f"Swarm service '{service_id_or_name}' not found. Assuming already removed or never existed.")
+        return True # Consider it a success if it's not there
+    except APIError as e:
+        logger.error(f"Docker API error removing service '{service_id_or_name}': {e}", exc_info=True)
         return False
     except Exception as e:
-        logger.error(f"Unexpected error stopping container {container_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error stopping/removing service '{service_id_or_name}': {e}", exc_info=True)
         return False 
 
 # --- ADDED: Get Running Bot Status --- 
 # Make the function async
 async def get_running_bots_status(user_id: int) -> List[Dict[str, Any]]:
-    """Gets status of RUNNING bot containers for a user using labels via socket API, including DB lookup for meeting details."""
-    session = get_socket_session()
-    if not session:
-        logger.error("[Bot Status] Cannot get status, requests_unixsocket session not available.")
+    """Gets status of RUNNING bot services for a user using labels, including DB lookup for meeting details."""
+    client = None
+    try:
+        client = get_docker_client()
+    except DockerNotFound:
+        logger.error("[Bot Status] Cannot get status, Docker client not available.")
+        return []
+        
+    if not client: # Should be caught by exception
+        logger.error("[Bot Status] Docker client is None after get_docker_client call.")
         return [] 
         
     bots_status = []
-    running_containers = [] # Initialize
     try:
-        # Construct filters for Docker API
-        filters = json.dumps({
-            "label": [f"vexa.user_id={user_id}"],
-            "status": ["running"]
-        })
+        # List services labeled for the user
+        service_label_filter = f"vexa.user_id={user_id}"
+        logger.debug(f"[Bot Status] Querying Swarm services with label filter: '{service_label_filter}'")
+        user_bot_services = client.services.list(filters={"label": service_label_filter})
         
-        # Make request to list containers endpoint
-        socket_path_relative = DOCKER_HOST.split('//', 1)[1]
-        socket_path_abs = f"/{socket_path_relative}"
-        socket_path_encoded = socket_path_abs.replace("/", "%2F")
-        socket_url_base = f'http+unix://{socket_path_encoded}'
-        list_url = f'{socket_url_base}/containers/json'
-        
-        logger.debug(f"[Bot Status] Querying {list_url} with filters: {filters}")
-        response = session.get(list_url, params={"filters": filters, "all": "false"})
-        response.raise_for_status()
-        
-        running_containers = response.json()
-        logger.info(f"[Bot Status] Found {len(running_containers)} running containers for user {user_id}")
+        logger.info(f"[Bot Status] Found {len(user_bot_services)} Swarm services potentially for user {user_id}")
 
-    except RequestException as sock_err:
-        logger.error(f"[Bot Status] Failed to list containers via socket API for user {user_id}: {sock_err}", exc_info=True)
-        return [] # Return empty on error listing containers
-    except Exception as e:
-        logger.error(f"[Bot Status] Unexpected error listing containers for user {user_id}: {e}", exc_info=True)
-        return []
-        
-    # Perform DB lookups asynchronously for each container
-    async with async_session_local() as db_session:
-        for container_info in running_containers:
-            platform = None
-            native_meeting_id = None
-            meeting_id_int = None
-            
-            container_id = container_info.get('Id')
-            name = container_info.get('Names', ['N/A'])[0].lstrip('/')
-            created_at_unix = container_info.get('Created')
-            created_at = datetime.fromtimestamp(created_at_unix, timezone.utc).isoformat() if created_at_unix else None
-            status = container_info.get('Status')
-            labels = container_info.get('Labels', {})
-            
-            # Parse meeting_id from name: vexa-bot-{meeting_id}-{uuid}
-            meeting_id_from_name = "unknown"
-            try:
-                 parts = name.split('-')
-                 if len(parts) > 2 and parts[0] == 'vexa' and parts[1] == 'bot':
-                      meeting_id_from_name = parts[2]
-                      # Try converting to int for DB lookup
-                      meeting_id_int = int(meeting_id_from_name)
-            except (ValueError, IndexError, Exception) as parse_err:
-                 logger.warning(f"[Bot Status] Could not parse meeting ID from container name '{name}': {parse_err}")
-                 meeting_id_int = None # Ensure it's None if parsing fails
-            
-            # If we have a valid meeting ID, query the DB
-            if meeting_id_int is not None:
+        # For each service, get more details and associated task status
+        async with async_session_local() as db_session:
+            for service in user_bot_services:
+                service_attrs = service.attrs # Full service attributes
+                service_spec = service_attrs.get('Spec', {})
+                service_name = service_spec.get('Name', 'N/A')
+                service_id = service.id
+                service_labels = service_spec.get('Labels', {})
+                
+                # Extract meeting_id and connection_id from service labels
+                meeting_id_str = service_labels.get('vexa.meeting_id')
+                connection_id = service_labels.get('vexa.connection_id')
+                
+                created_at_timestamp = service_attrs.get('CreatedAt') 
+                created_at_iso = None
+                if created_at_timestamp:
+                    try:
+                        if '.' in created_at_timestamp and len(created_at_timestamp.split('.')[1]) > 7:
+                            created_at_timestamp = created_at_timestamp[:created_at_timestamp.find('.')+7] + "Z"
+                        created_at_iso = datetime.fromisoformat(created_at_timestamp.replace('Z', '+00:00')).isoformat()
+                    except ValueError as ve:
+                        logger.warning(f"Could not parse service CreatedAt timestamp '{created_at_timestamp}': {ve}")
+
+                task_status_str = "unknown"
+                tasks = client.tasks.list(filters={"service": service.id, "desired-state": "running"})
+                if tasks: 
+                    task = tasks[0] 
+                    task_state = task.attrs.get('Status', {}).get('State', 'unknown')
+                    task_message = task.attrs.get('Status', {}).get('Message', '')
+                    task_err = task.attrs.get('Status', {}).get('Err')
+                    task_status_str = f"{task_state}"
+                    if task_message and task_message != "started": task_status_str += f" ({task_message})"
+                    if task_err: task_status_str += f" Error: {task_err}"
+                else: 
+                    tasks_all_states = client.tasks.list(filters={"service": service.id})
+                    if tasks_all_states:
+                        task = tasks_all_states[0]
+                        task_state = task.attrs.get('Status', {}).get('State', 'unknown')
+                        task_status_str = f"Task state: {task_state}" 
+                    else:
+                        task_status_str = "No tasks found for service"
+
+                platform_db = None
+                native_meeting_id_db = None
+                meeting_id_int = None # Initialize before try
+                if meeting_id_str:
+                    try:
+                        meeting_id_int = int(meeting_id_str)
+                        # Nested try for the DB operation, only if meeting_id_int is valid
                 try:
                     meeting = await db_session.get(Meeting, meeting_id_int)
                     if meeting:
-                        platform = meeting.platform
-                        native_meeting_id = meeting.platform_specific_id
-                        logger.debug(f"[Bot Status] Found DB details for meeting {meeting_id_int}: platform={platform}, native_id={native_meeting_id}")
+                                platform_db = meeting.platform
+                                native_meeting_id_db = meeting.platform_specific_id
                     else:
-                        logger.warning(f"[Bot Status] No meeting found in DB for ID {meeting_id_int} parsed from container '{name}'")
-                except Exception as db_err:
-                    logger.error(f"[Bot Status] DB error fetching meeting {meeting_id_int}: {db_err}", exc_info=True)
-            
+                                logger.warning(f"[Bot Status] No meeting found in DB for ID {meeting_id_int} from service '{service_name}'")
+                        except Exception as db_err: # Handles errors from db_session.get or related logic
+                            logger.error(f"[Bot Status] DB error fetching meeting {meeting_id_int} for service '{service_name}': {db_err}", exc_info=True)
+                    except ValueError: # Handles errors from int(meeting_id_str)
+                        logger.warning(f"[Bot Status] Could not parse meeting_id '{meeting_id_str}' to int for DB lookup (service: {service_name}).")
+                
+                # This append MUST be inside the 'for service in user_bot_services:' loop
             bots_status.append({
-                "container_id": container_id,
-                "container_name": name,
-                "platform": platform, # Added
-                "native_meeting_id": native_meeting_id, # Added
-                "status": status,
-                "created_at": created_at,
-                "labels": labels,
-                "meeting_id_from_name": meeting_id_from_name
-            })
+                    "service_id": service_id,
+                    "service_name": service_name,
+                    "connection_id": connection_id,
+                    "meeting_id": meeting_id_str, 
+                    "platform": platform_db, 
+                    "native_meeting_id": native_meeting_id_db, 
+                    "status": task_status_str, 
+                    "created_at": created_at_iso, 
+                    "labels": service_labels
+                })
+            # End of 'for service' loop
+        # End of 'async with' block
+            
+    except APIError as api_err:
+        logger.error(f"[Bot Status] Docker API error listing services/tasks for user {user_id}: {api_err}", exc_info=True)
+        return [] # Return empty on error
+    except Exception as e:
+        logger.error(f"[Bot Status] Unexpected error listing bot services for user {user_id}: {e}", exc_info=True)
+        return []
             
     return bots_status
 # --- END: Get Running Bot Status --- 

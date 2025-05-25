@@ -34,6 +34,10 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # Install CPU-optimized faster-whisper
 RUN pip install --no-cache-dir 'faster-whisper[cpu]'
 
+# Create models directory and download the tiny model
+RUN mkdir -p /app/models
+RUN python -c "from faster_whisper import WhisperModel; model = WhisperModel('tiny', device='cpu', download_root='/app/models')"
+
 # Now copy the application code
 COPY services/WhisperLive/ /app/
 
@@ -41,9 +45,13 @@ COPY services/WhisperLive/ /app/
 COPY services/WhisperLive/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Set environment variables for the baked-in model
+ENV WHISPER_MODEL_PATH=/app/models/faster-whisper-tiny
+ENV WHISPER_MODEL_SIZE=tiny
+
 # Set it as the entrypoint
 ENTRYPOINT ["/entrypoint.sh"]
 
 # Default command to run the server with faster_whisper backend
-# Use a small model size and more CPU threads for better performance
-CMD ["--port", "9090", "--backend", "faster_whisper", "--omp_num_threads", "4"] 
+# Use the baked-in tiny model and more CPU threads for better performance
+CMD ["--port", "9090", "--backend", "faster_whisper", "--model", "tiny", "--omp_num_threads", "4"] 
