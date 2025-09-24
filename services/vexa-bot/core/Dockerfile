@@ -23,8 +23,8 @@ RUN npm install -g typescript
 # Copy the rest of the application source code
 COPY . .
 
-# Build the TypeScript code
-RUN tsc
+# Build the TypeScript code and browser utilities bundle
+RUN npm run build
 
 # Install Playwright dependencies (if not already installed via npm)
 RUN npx playwright install-deps && npx playwright install --with-deps
